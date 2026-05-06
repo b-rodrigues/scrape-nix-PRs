@@ -1,0 +1,166 @@
+name: Scrape nixpkgs PRs
+
+on:
+  schedule:
+    # Every Sunday at 02:00 UTC
+    - cron: "0 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Number of PRs to collect per run config"
+        required: false
+        default: "100"
+      dry_run:
+        description: "Dry run (find PRs but do not scrape or push)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: scrape-nixpkgs
+  cancel-in-progress: false   # never interrupt a running scrape mid-push
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write           # needed to push scraped data back
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so incremental pushes don't clobber anything
+          fetch-depth: 0
+
+      # ── Python ──────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install requests
+
+      # ── Restore skip-list of already-scraped PRs ─────────────────────
+      # We keep a flat file of every PR number ever scraped so we never
+      # re-download it on subsequent runs.
+      - name: Load scraped-PR registry
+        id: registry
+        run: |
+          mkdir -p fodder
+          if [ -f fodder/.scraped_prs ]; then
+            echo "Existing registry: $(wc -l < fodder/.scraped_prs) entries"
+          else
+            touch fodder/.scraped_prs
+            echo "No registry yet — starting fresh"
+          fi
+
+      # ── Run each scrape config ───────────────────────────────────────
+      # configs/ holds one YAML file per "dataset slice" you want to maintain.
+      # The step below iterates over all of them.
+      - name: Run scrape configs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LIMIT_OVERRIDE: ${{ github.event.inputs.limit }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          LIMIT="${LIMIT_OVERRIDE:-100}"
+          COMBINED_LIST="$(mktemp)"
+
+          for cfg in configs/*.env; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Config: $cfg"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+            # Each .env file exports: KEYWORDS, LABELS, MIN_REVIEWS, SINCE
+            # (all optional — see configs/README.md)
+            unset KEYWORDS LABELS MIN_REVIEWS SINCE
+            source "$cfg"
+
+            FIND_ARGS="--limit $LIMIT"
+            [ -n "${KEYWORDS:-}" ]    && FIND_ARGS="$FIND_ARGS --keywords '$KEYWORDS'"
+            [ -n "${LABELS:-}" ]      && FIND_ARGS="$FIND_ARGS --labels '$LABELS'"
+            [ -n "${MIN_REVIEWS:-}" ] && FIND_ARGS="$FIND_ARGS --min-reviews $MIN_REVIEWS"
+            [ -n "${SINCE:-}" ]       && FIND_ARGS="$FIND_ARGS --since $SINCE"
+
+            SLICE_LIST="$(mktemp)"
+            eval python scripts/find_reviewed_prs.py $FIND_ARGS --out "$SLICE_LIST"
+
+            echo "  Found $(wc -l < "$SLICE_LIST") candidates from $cfg"
+            cat "$SLICE_LIST" >> "$COMBINED_LIST"
+          done
+
+          # Deduplicate and remove already-scraped PRs
+          sort -u "$COMBINED_LIST" | \
+            comm -23 - <(sort fodder/.scraped_prs) \
+            > new_prs.txt
+
+          echo "New PRs to scrape: $(wc -l < new_prs.txt)"
+          cat new_prs.txt
+
+      - name: Scrape new PRs
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -s new_prs.txt ]; then
+            echo "Nothing new to scrape — exiting early."
+            exit 0
+          fi
+
+          python scripts/scrape_nixpkgs_prs.py \
+            --pr-file new_prs.txt \
+            --out fodder/
+
+          # Append newly scraped PR numbers to the registry
+          cat new_prs.txt >> fodder/.scraped_prs
+          sort -u fodder/.scraped_prs -o fodder/.scraped_prs
+
+          echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
+
+      # ── Stats snapshot ───────────────────────────────────────────────
+      - name: Write run stats
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          STATS_FILE="fodder/.last_run.json"
+          NEW_COUNT=$(wc -l < new_prs.txt 2>/dev/null || echo 0)
+          TOTAL=$(wc -l < fodder/.scraped_prs 2>/dev/null || echo 0)
+          cat > "$STATS_FILE" <<EOF
+          {
+            "last_run": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "new_prs_this_run": ${NEW_COUNT},
+            "total_prs_scraped": ${TOTAL},
+            "triggered_by": "${{ github.event_name }}"
+          }
+          EOF
+          cat "$STATS_FILE"
+
+      # ── Commit & push ────────────────────────────────────────────────
+      - name: Commit and push fodder
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add fodder/
+          # Only commit if there's actually something new
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            NEW_COUNT=$(wc -l < new_prs.txt 2>/dev/null || echo 0)
+            TOTAL=$(wc -l < fodder/.scraped_prs 2>/dev/null || echo 0)
+            git commit -m "chore(fodder): add ${NEW_COUNT} PRs [total: ${TOTAL}]
+
+          Triggered by: ${{ github.event_name }}
+          Run: ${{ github.run_id }}"
+            git push
+          fi
