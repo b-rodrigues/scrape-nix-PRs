@@ -213,7 +213,10 @@ def collect_pr_numbers(
             time.sleep(0.3)  # polite pacing
 
     # Write results
-    out_path.write_text("\n".join(str(n) for n in collected) + "\n", encoding="utf-8")
+    if collected:
+        out_path.write_text("\n".join(str(n) for n in collected) + "\n", encoding="utf-8")
+    else:
+        out_path.write_text("", encoding="utf-8")
     print(f"\nWrote {len(collected)} PR numbers → {out_path}")
 
     if len(collected) < limit:
