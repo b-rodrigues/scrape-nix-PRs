@@ -97,6 +97,22 @@ def get_diff(pr_number: int) -> str:
     return r.text
 
 
+def fetch_raw_file(repo: str, ref: str, path: str) -> str:
+    """Fetch the raw content of a file from a specific ref."""
+    # Using raw.githubusercontent.com is often faster and bypasses some API limits.
+    # We include the Authorization header if available, which works for private repos
+    # and can sometimes help with rate limits on the raw endpoint too.
+    url = f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=30)
+        if r.status_code == 404:
+            return "[File not found at this ref]"
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        return f"[Error fetching file: {e}]"
+
+
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
@@ -104,6 +120,18 @@ def get_diff(pr_number: int) -> str:
 def fetch_pr(pr_number: int) -> dict:
     url = f"{BASE_URL}/repos/{REPO}/pulls/{pr_number}"
     return _get(url)
+
+
+def fetch_files(pr_number: int) -> list:
+    """List of files changed in the PR."""
+    url = f"{BASE_URL}/repos/{REPO}/pulls/{pr_number}/files"
+    return paginate(url)
+
+
+def fetch_commits(pr_number: int) -> list:
+    """Commits in the PR."""
+    url = f"{BASE_URL}/repos/{REPO}/pulls/{pr_number}/commits"
+    return paginate(url)
 
 
 def fetch_issue_comments(pr_number: int) -> list:
@@ -137,8 +165,26 @@ def format_pr(pr_number: int) -> str:
     print(f"  fetching PR metadata …", flush=True)
     pr = fetch_pr(pr_number)
 
+    # Safely extract repo info (head repo can be None if the fork was deleted)
+    base_data = pr.get("base") or {}
+    head_data = pr.get("head") or {}
+
+    base_repo_data = base_data.get("repo") or {}
+    head_repo_data = head_data.get("repo") or {}
+
+    base_repo = base_repo_data.get("full_name", REPO)
+    head_repo = head_repo_data.get("full_name", REPO)
+    base_sha = base_data.get("sha")
+    head_sha = head_data.get("sha")
+
+    print(f"  fetching commits …", flush=True)
+    commits = fetch_commits(pr_number)
+
     print(f"  fetching diff …", flush=True)
     diff = get_diff(pr_number)
+
+    print(f"  fetching files list …", flush=True)
+    files = fetch_files(pr_number)
 
     print(f"  fetching issue comments …", flush=True)
     issue_comments = fetch_issue_comments(pr_number)
@@ -164,8 +210,8 @@ def format_pr(pr_number: int) -> str:
         f"Author : {_author(pr)}",
         f"State  : {pr.get('state', '')}  |  Merged: {pr.get('merged', False)}",
         f"URL    : {pr.get('html_url', '')}",
-        f"Base   : {pr.get('base', {}).get('ref', '')}  ←  "
-        f"{pr.get('head', {}).get('ref', '')}",
+        f"Base   : {pr.get('base', {}).get('ref', '')} ({base_sha})",
+        f"Head   : {pr.get('head', {}).get('ref', '')} ({head_sha})",
         "=" * 72,
     ]
 
@@ -178,6 +224,37 @@ def format_pr(pr_number: int) -> str:
     labels = [lbl["name"] for lbl in pr.get("labels", [])]
     if labels:
         lines += [f"Labels: {', '.join(labels)}", ""]
+
+    # ── Commits ──────────────────────────────────────────────────────────────
+    if commits:
+        lines += ["", "## COMMITS", ""]
+        for c in commits:
+            sha = c.get("sha", "")[:8]
+            msg = c.get("commit", {}).get("message", "").splitlines()[0]
+            lines.append(f"  {sha}  {msg}")
+
+    # ── Full File Contents ──────────────────────────────────────────────────
+    # We only fetch contents for a reasonable number of files to avoid massive files/rate limits
+    MAX_FILES_FOR_CONTENTS = 10
+    if files:
+        lines += ["", "## CHANGED FILES CONTENTS", ""]
+        for i, f in enumerate(files):
+            path = f.get("filename", "")
+            status = f.get("status", "")
+            lines += [f"### File: {path} ({status})"]
+
+            if i < MAX_FILES_FOR_CONTENTS:
+                if status in ("modified", "deleted", "renamed"):
+                    print(f"    fetching base content for {path} …", flush=True)
+                    base_content = fetch_raw_file(base_repo, base_sha, path)
+                    lines += ["#### BASE CONTENT", "```", base_content, "```", ""]
+
+                if status in ("modified", "added", "renamed"):
+                    print(f"    fetching head content for {path} …", flush=True)
+                    head_content = fetch_raw_file(head_repo, head_sha, path)
+                    lines += ["#### HEAD CONTENT", "```", head_content, "```", ""]
+            else:
+                lines += ["(Skipping full content for this file due to limit)", ""]
 
     # ── Diff ─────────────────────────────────────────────────────────────────
     lines += ["", "## DIFF", ""]

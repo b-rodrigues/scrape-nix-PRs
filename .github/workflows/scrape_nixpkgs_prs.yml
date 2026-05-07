@@ -100,11 +100,12 @@ jobs:
             done
 
             # Deduplicate and remove already-scraped PRs
-            sort -u "$COMBINED_LIST" | \
-              comm -23 - <(sort fodder/.scraped_prs) \
+            # Filter out empty lines to be safe
+            sort -u "$COMBINED_LIST" | grep -v "^$" | \
+              comm -23 - <(sort fodder/.scraped_prs | grep -v "^$") \
               > new_prs.txt
 
-            echo "New PRs to scrape: $(wc -l < new_prs.txt)"
+            echo "New PRs to scrape: $(grep -c "^[0-9]\+$" new_prs.txt || echo 0)"
             cat new_prs.txt
           '
 
@@ -114,17 +115,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           nix develop --command bash -euo pipefail -c '
-            if [ ! -s new_prs.txt ]; then
+            # Only proceed if new_prs.txt contains actual PR numbers
+            if ! grep -q "^[0-9]\+$" new_prs.txt; then
               echo "Nothing new to scrape — exiting early."
               exit 0
             fi
 
-            python scrape_nixpkgs_prs.py \
-              --pr-file new_prs.txt \
-              --out fodder/
+            # Create a temporary directory for scraping to avoid partial failures polluting fodder/
+            SCRAPE_TEMP=$(mktemp -d)
 
-            # Append newly scraped PR numbers to the registry
-            cat new_prs.txt >> fodder/.scraped_prs
+            # Use a list of PRs that are actually numbers
+            grep "^[0-9]\+$" new_prs.txt > verified_prs.txt
+
+            python scrape_nixpkgs_prs.py \
+              --pr-file verified_prs.txt \
+              --out "$SCRAPE_TEMP"
+
+            # Only add successfully scraped PRs to the registry and move them to fodder
+            for pr_file in "$SCRAPE_TEMP"/*.txt; do
+              if [ -f "$pr_file" ]; then
+                pr_num=$(basename "$pr_file" .txt | sed "s/pr_//")
+                echo "$pr_num" >> fodder/.scraped_prs
+                mv "$pr_file" fodder/
+              fi
+            done
+
             sort -u fodder/.scraped_prs -o fodder/.scraped_prs
 
             echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
