@@ -64,86 +64,83 @@ jobs:
           LIMIT_OVERRIDE: ${{ github.event.inputs.limit }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          nix develop --command bash -euo pipefail -c '
-            LIMIT="${LIMIT_OVERRIDE:-100}"
-            COMBINED_LIST="$(mktemp)"
-            mapfile -t config_files < <(
-              find configs -maxdepth 1 -type f \( -name "*.env" -o -name ".env" \) | sort
-            )
+          LIMIT="${LIMIT_OVERRIDE:-100}"
+          COMBINED_LIST="$(mktemp)"
+          mapfile -t config_files < <(
+            find configs -maxdepth 1 -type f \( -name "*.env" -o -name ".env" \) | sort
+          )
 
-            if [ "${#config_files[@]}" -eq 0 ]; then
-              echo "No config env files found in configs/; exiting."
-              exit 0
-            fi
+          if [ "${#config_files[@]}" -eq 0 ]; then
+            echo "No config env files found in configs/; exiting."
+            exit 0
+          fi
 
-            for cfg in "${config_files[@]}"; do
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-              echo "Config: $cfg"
-              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          for cfg in "${config_files[@]}"; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "Config: $cfg"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-              # Each .env file exports: KEYWORDS, LABELS, MIN_REVIEWS, SINCE
-              # (all optional — see configs/README.md)
-              unset KEYWORDS LABELS MIN_REVIEWS SINCE
-              source "$cfg"
+            # Each .env file exports: KEYWORDS, LABELS, MIN_REVIEWS, SINCE, OR_KEYWORDS, LIMIT
+            unset KEYWORDS LABELS MIN_REVIEWS SINCE OR_KEYWORDS LIMIT_CFG
+            source "$cfg"
 
-              find_args=(--limit "$LIMIT")
-              [ -n "${KEYWORDS:-}" ] && find_args+=(--keywords "$KEYWORDS")
-              [ -n "${LABELS:-}" ] && find_args+=(--labels "$LABELS")
-              [ -n "${MIN_REVIEWS:-}" ] && find_args+=(--min-reviews "$MIN_REVIEWS")
-              [ -n "${SINCE:-}" ] && find_args+=(--since "$SINCE")
+            # Use LIMIT from env file if present, otherwise use global LIMIT
+            CURRENT_LIMIT="${LIMIT_CFG:-$LIMIT}"
+            find_args=(--limit "$CURRENT_LIMIT")
+            [ -n "${KEYWORDS:-}" ] && find_args+=(--keywords "$KEYWORDS")
+            [ -n "${LABELS:-}" ] && find_args+=(--labels "$LABELS")
+            [ -n "${MIN_REVIEWS:-}" ] && find_args+=(--min-reviews "$MIN_REVIEWS")
+            [ -n "${SINCE:-}" ] && find_args+=(--since "$SINCE")
+            [ "${OR_KEYWORDS:-}" = "true" ] && find_args+=(--or-keywords)
 
-              SLICE_LIST="$(mktemp)"
-              python find_reviewed_prs.py "${find_args[@]}" --out "$SLICE_LIST"
+            SLICE_LIST="$(mktemp)"
+            nix run .#find-prs -- "${find_args[@]}" --out "$SLICE_LIST"
 
-              echo "  Found $(wc -l < "$SLICE_LIST") candidates from $cfg"
-              cat "$SLICE_LIST" >> "$COMBINED_LIST"
-            done
+            echo "  Found $(wc -l < "$SLICE_LIST") candidates from $cfg"
+            cat "$SLICE_LIST" >> "$COMBINED_LIST"
+          done
 
-            # Deduplicate and remove already-scraped PRs
-            # Filter out empty lines to be safe
-            sort -u "$COMBINED_LIST" | grep -v "^$" | \
-              comm -23 - <(sort fodder/.scraped_prs | grep -v "^$") \
-              > new_prs.txt
+          # Deduplicate and remove already-scraped PRs
+          sort -u "$COMBINED_LIST" | grep -v "^$" | \
+            comm -23 - <(sort fodder/.scraped_prs | grep -v "^$") \
+            > new_prs.txt
 
-            echo "New PRs to scrape: $(grep -c "^[0-9]\+$" new_prs.txt || echo 0)"
-            cat new_prs.txt
-          '
+          echo "New PRs to scrape: $(grep -c "^[0-9]\+$" new_prs.txt || echo 0)"
+          cat new_prs.txt
 
       - name: Scrape new PRs
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          nix develop --command bash -euo pipefail -c '
-            # Only proceed if new_prs.txt contains actual PR numbers
-            if ! grep -q "^[0-9]\+$" new_prs.txt; then
-              echo "Nothing new to scrape — exiting early."
-              exit 0
+          # Only proceed if new_prs.txt contains actual PR numbers
+          if ! grep -q "^[0-9]\+$" new_prs.txt; then
+            echo "Nothing new to scrape — exiting early."
+            exit 0
+          fi
+
+          # Create a temporary directory for scraping to avoid partial failures polluting fodder/
+          SCRAPE_TEMP=$(mktemp -d)
+
+          # Use a list of PRs that are actually numbers
+          grep "^[0-9]\+$" new_prs.txt > verified_prs.txt
+
+          nix run .#scrape-prs -- \
+            --pr-file verified_prs.txt \
+            --out "$SCRAPE_TEMP"
+
+          # Only add successfully scraped PRs to the registry and move them to fodder
+          for pr_file in "$SCRAPE_TEMP"/*.txt; do
+            if [ -f "$pr_file" ]; then
+              pr_num=$(basename "$pr_file" .txt | sed "s/pr_//")
+              echo "$pr_num" >> fodder/.scraped_prs
+              mv "$pr_file" fodder/
             fi
+          done
 
-            # Create a temporary directory for scraping to avoid partial failures polluting fodder/
-            SCRAPE_TEMP=$(mktemp -d)
+          sort -u fodder/.scraped_prs -o fodder/.scraped_prs
 
-            # Use a list of PRs that are actually numbers
-            grep "^[0-9]\+$" new_prs.txt > verified_prs.txt
-
-            python scrape_nixpkgs_prs.py \
-              --pr-file verified_prs.txt \
-              --out "$SCRAPE_TEMP"
-
-            # Only add successfully scraped PRs to the registry and move them to fodder
-            for pr_file in "$SCRAPE_TEMP"/*.txt; do
-              if [ -f "$pr_file" ]; then
-                pr_num=$(basename "$pr_file" .txt | sed "s/pr_//")
-                echo "$pr_num" >> fodder/.scraped_prs
-                mv "$pr_file" fodder/
-              fi
-            done
-
-            sort -u fodder/.scraped_prs -o fodder/.scraped_prs
-
-            echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
-          '
+          echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
 
       # ── Stats snapshot ───────────────────────────────────────────────
       - name: Write run stats

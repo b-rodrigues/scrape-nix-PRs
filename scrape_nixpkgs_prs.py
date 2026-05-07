@@ -56,6 +56,8 @@ if TOKEN:
 def _get(url: str, params: dict = None) -> dict | list:
     """GET with automatic rate-limit retry and pagination support."""
     while True:
+        # Small delay to stay under secondary rate limits during large batches
+        time.sleep(0.2)
         r = requests.get(url, headers=HEADERS, params=params, timeout=30)
         if r.status_code == 403 and "rate limit" in r.text.lower():
             reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
@@ -88,6 +90,8 @@ def paginate(url: str, params: dict = None) -> list:
 def get_diff(pr_number: int) -> str:
     """Fetch the raw unified diff for a PR."""
     url = f"{BASE_URL}/repos/{REPO}/pulls/{pr_number}"
+    # Small delay to stay under secondary rate limits
+    time.sleep(0.2)
     r = requests.get(
         url,
         headers={**HEADERS, "Accept": "application/vnd.github.diff"},
@@ -152,6 +156,43 @@ def fetch_review_comments(pr_number: int) -> list:
     return paginate(url)
 
 
+def group_comments_into_threads(comments: list) -> list[dict]:
+    """Group flat list of review comments into conversation threads."""
+    threads: dict[int, list] = {}
+    roots: list[int] = []
+    
+    # First pass: map all comments by ID
+    comment_map = {c['id']: c for c in comments}
+    
+    for c in comments:
+        parent_id = c.get('in_reply_to_id')
+        if parent_id and parent_id in comment_map:
+            threads.setdefault(parent_id, []).append(c)
+        else:
+            roots.append(c['id'])
+            
+    result = []
+    for root_id in roots:
+        root_comment = comment_map[root_id]
+        thread = [root_comment]
+        # Recursively find replies (though usually it's just one level in the API, 
+        # but let's be robust)
+        to_process = [root_id]
+        while to_process:
+            curr_id = to_process.pop(0)
+            replies = sorted(threads.get(curr_id, []), key=lambda x: x.get('created_at', ''))
+            for r in replies:
+                thread.append(r)
+                to_process.append(r['id'])
+        result.append({
+            'path': root_comment.get('path'),
+            'line': root_comment.get('line') or root_comment.get('original_line'),
+            'diff_hunk': root_comment.get('diff_hunk'),
+            'comments': thread
+        })
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -194,12 +235,7 @@ def format_pr(pr_number: int) -> str:
 
     print(f"  fetching inline review comments …", flush=True)
     review_comments = fetch_review_comments(pr_number)
-
-    # Index inline comments by review id for easy lookup
-    comments_by_review: dict[int, list] = {}
-    for c in review_comments:
-        rid = c.get("pull_request_review_id")
-        comments_by_review.setdefault(rid, []).append(c)
+    comment_threads = group_comments_into_threads(review_comments)
 
     lines: list[str] = []
 
@@ -271,45 +307,40 @@ def format_pr(pr_number: int) -> str:
             ]
 
     # ── Reviews (with their inline comments interleaved) ──────────────────
+    # ── Review Threads (Inline) ───────────────────────────────────────────
+    if comment_threads:
+        lines += ["", "## REVIEW DISCUSSIONS (INLINE)", ""]
+        for thread in comment_threads:
+            path = thread['path']
+            line = thread['line']
+            lines += [f"### File: {path} (line {line})", ""]
+            
+            diff_hunk = (thread['diff_hunk'] or "").strip()
+            if diff_hunk:
+                lines += ["#### Context", "```diff", diff_hunk, "```", ""]
+            
+            for i, c in enumerate(thread['comments']):
+                author = _author(c)
+                body = (c.get('body') or "").strip()
+                prefix = "      " if i > 0 else ""
+                lines += [f"{prefix}@{author}: {body}", ""]
+            lines.append("")
+
+    # ── Reviews (Summary) ──────────────────────────────────────────────────
     if reviews:
-        lines += ["", "## REVIEWS", ""]
+        lines += ["", "## REVIEW SUMMARIES", ""]
         for review in reviews:
-            rid = review.get("id")
             state = review.get("state", "COMMENTED")
             reviewer = _author(review)
             submitted_at = review.get("submitted_at", "")
             review_body = (review.get("body") or "").strip()
 
-            lines += [
-                f"--- review by @{reviewer} [{state}] at {submitted_at} ---",
-            ]
-            if review_body:
-                lines += [review_body, ""]
-
-            # Inline comments belonging to this review
-            inlines = comments_by_review.get(rid, [])
-            if inlines:
-                lines.append("  Inline comments:")
-                for ic in inlines:
-                    path = ic.get("path", "")
-                    line_info = ""
-                    if ic.get("line"):
-                        line_info = f" line {ic['line']}"
-                    elif ic.get("original_line"):
-                        line_info = f" line {ic['original_line']}"
-
-                    diff_hunk = (ic.get("diff_hunk") or "").strip()
-                    comment_body = (ic.get("body") or "").strip()
-                    in_reply_to = ic.get("in_reply_to_id")
-
-                    lines.append(
-                        f"  [{path}{line_info}]"
-                        + (f" (reply to #{in_reply_to})" if in_reply_to else "")
-                    )
-                    if diff_hunk:
-                        for dl in diff_hunk.splitlines():
-                            lines.append(f"    > {dl}")
-                    lines += [f"  @{_author(ic)}: {comment_body}", ""]
+            if review_body or state != "COMMENTED":
+                lines += [
+                    f"--- @{reviewer} [{state}] at {submitted_at} ---",
+                    review_body,
+                    "",
+                ]
 
     lines.append("=" * 72)
     return "\n".join(lines)

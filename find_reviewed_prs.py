@@ -60,6 +60,8 @@ if TOKEN:
 
 def _get(url: str, params: dict = None) -> dict | list:
     while True:
+        # Small polite delay to stay under secondary rate limits during large batches
+        time.sleep(0.2)
         r = requests.get(url, headers=HEADERS, params=params, timeout=30)
         if r.status_code == 403 and "rate limit" in r.text.lower():
             reset = int(r.headers.get("X-RateLimit-Reset", time.time() + 60))
@@ -124,14 +126,19 @@ def _iter_windows(since: date, until: date, window_days: int = 30):
         cursor = end + timedelta(days=1)
 
 
-def build_query(since_str: str | None, until_str: str | None, labels: list[str], keywords: list[str]) -> str:
+def build_query(labels: list[str], keywords: list[str], use_or: bool = False) -> str:
     q = f"repo:{REPO} is:pr is:merged reviewed:true"
     for label in labels:
         q += f' label:"{label}"'
-    for kw in keywords:
-        # Quoted so multi-word phrases like "final attrs" work too
-        q += f' "{kw}"'
-    return q  # date range appended per-window in the loop below
+    
+    if keywords:
+        if use_or:
+            kw_part = " OR ".join(f'"{kw}"' for kw in keywords)
+            q += f" ({kw_part})"
+        else:
+            for kw in keywords:
+                q += f' "{kw}"'
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +153,7 @@ def collect_pr_numbers(
     labels: list[str],
     keywords: list[str],
     out_path: Path,
+    use_or: bool = False,
 ) -> None:
     if not TOKEN:
         print(
@@ -156,7 +164,7 @@ def collect_pr_numbers(
     since = since or date(2023, 1, 1)
     until = until or date.today()
 
-    base_query = build_query(None, None, labels, keywords)
+    base_query = build_query(labels, keywords, use_or=use_or)
     collected: list[int] = []
     seen: set[int] = set()
 
@@ -164,7 +172,7 @@ def collect_pr_numbers(
     print(f"Date range : {since} → {until}")
     print(f"Min reviews: {min_reviews}")
     print(f"Labels     : {labels or '(any)'}")
-    print(f"Keywords   : {keywords or '(any)'}")
+    print(f"Keywords   : {keywords or '(any)'} ({'OR' if use_or else 'AND'} logic)")
     print(f"Target     : {limit} PRs\n")
 
     windows = list(_iter_windows(since, until, window_days=30))
@@ -269,9 +277,12 @@ def main() -> None:
         "--keywords", type=str, default="",
         help=(
             "Comma-separated keywords to search for in PR title/body.  "
-            "Each keyword is matched as a phrase (quoted).  "
-            "Example: --keywords 'treewide,finalAttrs,passthru.tests'"
+            "Example: --keywords 'treewide,finalAttrs'"
         ),
+    )
+    parser.add_argument(
+        "--or-keywords", action="store_true",
+        help="Use OR logic for keywords (default is AND)",
     )
     parser.add_argument(
         "--out", type=Path, default=Path("reviewed_prs.txt"),
@@ -290,6 +301,7 @@ def main() -> None:
         labels=labels,
         keywords=keywords,
         out_path=args.out,
+        use_or=args.or_keywords,
     )
 
     print(f"\nNext step:\n  python scrape_nixpkgs_prs.py --pr-file {args.out} --out ./pr_data")
