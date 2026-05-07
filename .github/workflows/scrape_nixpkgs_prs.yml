@@ -1,7 +1,8 @@
 name: Scrape nixpkgs PRs
 
 on:
-  push: main
+  push: 
+    - main
   schedule:
     # Every Sunday at 02:00 UTC
     - cron: "0 2 * * 0"
