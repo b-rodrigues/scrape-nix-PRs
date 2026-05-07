@@ -119,25 +119,18 @@ jobs:
             exit 0
           fi
 
-          # Create a temporary directory for scraping to avoid partial failures polluting fodder/
-          SCRAPE_TEMP=$(mktemp -d)
-
           # Use a list of PRs that are actually numbers
           grep "^[0-9]\+$" new_prs.txt > verified_prs.txt
 
-          nix run .#scrape-prs -- \
+          # Run scraper for up to 5 hours to leave time for commit/push
+          # Writing directly to fodder/ so files are ready even if interrupted
+          timeout 5h nix run .#scrape-prs -- \
             --pr-file verified_prs.txt \
-            --out "$SCRAPE_TEMP"
+            --out fodder/ || echo "Scraper reached timeout or failed, proceeding with what we have."
 
-          # Only add successfully scraped PRs to the registry and move them to fodder
-          for pr_file in "$SCRAPE_TEMP"/*.txt; do
-            if [ -f "$pr_file" ]; then
-              pr_num=$(basename "$pr_file" .txt | sed "s/pr_//")
-              echo "$pr_num" >> fodder/.scraped_prs
-              mv "$pr_file" fodder/
-            fi
-          done
-
+          # Update the registry based on what was actually written to fodder/
+          # This ensures the registry is always in sync with the files
+          find fodder -name "pr_*.txt" | sed 's/fodder\/pr_//;s/\.txt//' >> fodder/.scraped_prs
           sort -u fodder/.scraped_prs -o fodder/.scraped_prs
 
           echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
@@ -175,9 +168,14 @@ jobs:
           else
             NEW_COUNT=$(wc -l < new_prs.txt 2>/dev/null || echo 0)
             TOTAL=$(wc -l < fodder/.scraped_prs 2>/dev/null || echo 0)
-            git commit -m "chore(fodder): add ${NEW_COUNT} PRs [total: ${TOTAL}]
+            
+            git commit -m "chore(fodder): add ${NEW_COUNT} PRs [total: ${TOTAL}]" \
+                       -m "Triggered by: ${{ github.event_name }}" \
+                       -m "Run: ${{ github.run_id }}"
+            
+            for i in {1..5}; do
+              git pull --rebase origin main && git push origin main && break || sleep 10
+            done
+          fi
 
-          Triggered by: ${{ github.event_name }}
-          Run: ${{ github.run_id }}"
-            git push
           fi
