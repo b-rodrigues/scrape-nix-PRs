@@ -67,8 +67,9 @@ jobs:
           nix develop --command bash -euo pipefail -c '
             LIMIT="${LIMIT_OVERRIDE:-100}"
             COMBINED_LIST="$(mktemp)"
-            shopt -s nullglob
-            config_files=(configs/*.env configs/.env configs/.*.env)
+            mapfile -t config_files < <(
+              find configs -maxdepth 1 -type f \( -name "*.env" -o -name ".env" \) | sort
+            )
 
             if [ "${#config_files[@]}" -eq 0 ]; then
               echo "No config env files found in configs/; exiting."
