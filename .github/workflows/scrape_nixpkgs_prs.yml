@@ -34,15 +34,12 @@ jobs:
           # Fetch full history so incremental pushes don't clobber anything
           fetch-depth: 0
 
-      # ── Python ──────────────────────────────────────────────────────────
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      # ── Nix / Python ────────────────────────────────────────────────────
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
         with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install requests
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
       # ── Restore skip-list of already-scraped PRs ─────────────────────
       # We keep a flat file of every PR number ever scraped so we never
@@ -67,63 +64,63 @@ jobs:
           LIMIT_OVERRIDE: ${{ github.event.inputs.limit }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          set -euo pipefail
+          nix develop --command bash -euo pipefail -c '
+            LIMIT="${LIMIT_OVERRIDE:-100}"
+            COMBINED_LIST="$(mktemp)"
 
-          LIMIT="${LIMIT_OVERRIDE:-100}"
-          COMBINED_LIST="$(mktemp)"
+            for cfg in configs/*.env; do
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "Config: $cfg"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-          for cfg in configs/*.env; do
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "Config: $cfg"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              # Each .env file exports: KEYWORDS, LABELS, MIN_REVIEWS, SINCE
+              # (all optional — see configs/README.md)
+              unset KEYWORDS LABELS MIN_REVIEWS SINCE
+              source "$cfg"
 
-            # Each .env file exports: KEYWORDS, LABELS, MIN_REVIEWS, SINCE
-            # (all optional — see configs/README.md)
-            unset KEYWORDS LABELS MIN_REVIEWS SINCE
-            source "$cfg"
+              find_args=(--limit "$LIMIT")
+              [ -n "${KEYWORDS:-}" ] && find_args+=(--keywords "$KEYWORDS")
+              [ -n "${LABELS:-}" ] && find_args+=(--labels "$LABELS")
+              [ -n "${MIN_REVIEWS:-}" ] && find_args+=(--min-reviews "$MIN_REVIEWS")
+              [ -n "${SINCE:-}" ] && find_args+=(--since "$SINCE")
 
-            FIND_ARGS="--limit $LIMIT"
-            [ -n "${KEYWORDS:-}" ]    && FIND_ARGS="$FIND_ARGS --keywords '$KEYWORDS'"
-            [ -n "${LABELS:-}" ]      && FIND_ARGS="$FIND_ARGS --labels '$LABELS'"
-            [ -n "${MIN_REVIEWS:-}" ] && FIND_ARGS="$FIND_ARGS --min-reviews $MIN_REVIEWS"
-            [ -n "${SINCE:-}" ]       && FIND_ARGS="$FIND_ARGS --since $SINCE"
+              SLICE_LIST="$(mktemp)"
+              python find_reviewed_prs.py "${find_args[@]}" --out "$SLICE_LIST"
 
-            SLICE_LIST="$(mktemp)"
-            eval python scripts/find_reviewed_prs.py $FIND_ARGS --out "$SLICE_LIST"
+              echo "  Found $(wc -l < "$SLICE_LIST") candidates from $cfg"
+              cat "$SLICE_LIST" >> "$COMBINED_LIST"
+            done
 
-            echo "  Found $(wc -l < "$SLICE_LIST") candidates from $cfg"
-            cat "$SLICE_LIST" >> "$COMBINED_LIST"
-          done
+            # Deduplicate and remove already-scraped PRs
+            sort -u "$COMBINED_LIST" | \
+              comm -23 - <(sort fodder/.scraped_prs) \
+              > new_prs.txt
 
-          # Deduplicate and remove already-scraped PRs
-          sort -u "$COMBINED_LIST" | \
-            comm -23 - <(sort fodder/.scraped_prs) \
-            > new_prs.txt
-
-          echo "New PRs to scrape: $(wc -l < new_prs.txt)"
-          cat new_prs.txt
+            echo "New PRs to scrape: $(wc -l < new_prs.txt)"
+            cat new_prs.txt
+          '
 
       - name: Scrape new PRs
         if: ${{ github.event.inputs.dry_run != 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          nix develop --command bash -euo pipefail -c '
+            if [ ! -s new_prs.txt ]; then
+              echo "Nothing new to scrape — exiting early."
+              exit 0
+            fi
 
-          if [ ! -s new_prs.txt ]; then
-            echo "Nothing new to scrape — exiting early."
-            exit 0
-          fi
+            python scrape_nixpkgs_prs.py \
+              --pr-file new_prs.txt \
+              --out fodder/
 
-          python scripts/scrape_nixpkgs_prs.py \
-            --pr-file new_prs.txt \
-            --out fodder/
+            # Append newly scraped PR numbers to the registry
+            cat new_prs.txt >> fodder/.scraped_prs
+            sort -u fodder/.scraped_prs -o fodder/.scraped_prs
 
-          # Append newly scraped PR numbers to the registry
-          cat new_prs.txt >> fodder/.scraped_prs
-          sort -u fodder/.scraped_prs -o fodder/.scraped_prs
-
-          echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
+            echo "Total scraped PRs in registry: $(wc -l < fodder/.scraped_prs)"
+          '
 
       # ── Stats snapshot ───────────────────────────────────────────────
       - name: Write run stats
