@@ -56,8 +56,8 @@ jobs:
           fi
 
       # ── Run each scrape config ───────────────────────────────────────
-      # configs/ holds one YAML file per "dataset slice" you want to maintain.
-      # The step below iterates over all of them.
+      # configs/ holds one .env file per "dataset slice" you want to maintain.
+      # The step below iterates over all matching env files.
       - name: Run scrape configs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,8 +67,15 @@ jobs:
           nix develop --command bash -euo pipefail -c '
             LIMIT="${LIMIT_OVERRIDE:-100}"
             COMBINED_LIST="$(mktemp)"
+            shopt -s nullglob
+            config_files=(configs/*.env configs/.*.env)
 
-            for cfg in configs/*.env; do
+            if [ "${#config_files[@]}" -eq 0 ]; then
+              echo "No config env files found in configs/; exiting."
+              exit 0
+            fi
+
+            for cfg in "${config_files[@]}"; do
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
               echo "Config: $cfg"
               echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
